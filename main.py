@@ -4,11 +4,13 @@
 让猫猫（PixNyaa）在自然对话中自主判断用户是否有作图需求，
 调用 NyaaComfyUI 服务器生成图片，并将成品图作为 image 段发到 QQ。
 
-V1 阶段：插件骨架 + 配置加载 + 输入内容审核 + llm_tool 注册。
+V1 全链路：插件骨架 + 配置加载 + 内容审核 + 提示词生成 + ComfyUI 出图。
 """
 
+import asyncio
 import json
 import os
+import random
 
 import httpx
 from dotenv import load_dotenv
@@ -27,9 +29,11 @@ class NyaaDrawPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
+        # ---- 插件目录 ----
+        self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
+
         # ---- 从插件目录 .env 加载配置 ----
-        plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        env_path = os.path.join(plugin_dir, ".env")
+        env_path = os.path.join(self._plugin_dir, ".env")
         if os.path.isfile(env_path):
             load_dotenv(env_path)
         else:
@@ -42,6 +46,18 @@ class NyaaDrawPlugin(Star):
         self.t2i_model: str | None = None
 
         self._load_config()
+
+        # ---- 预载 ComfyUI workflow 模板 ----
+        workflow_path = os.path.join(self._plugin_dir, "Anima-Nyaa.api.json")
+        try:
+            with open(workflow_path, "r", encoding="utf-8") as f:
+                self._workflow_json = f.read()
+            # 验证 JSON 合法
+            json.loads(self._workflow_json)
+            logger.info("[NyaaDraw] workflow 模板加载成功")
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.error(f"[NyaaDraw] workflow 模板加载失败: {e}")
+            self._workflow_json = None
 
     # ------------------------------------------------------------------
     # 配置加载
@@ -236,6 +252,125 @@ class NyaaDrawPlugin(Star):
         return prompt
 
     # ------------------------------------------------------------------
+    # ComfyUI 出图（HTTP 轮询）
+    # ------------------------------------------------------------------
+
+    # 常量
+    COMFYUI_POLL_INTERVAL = 2       # 轮询间隔（秒）
+    COMFYUI_POLL_MAX = 90           # 最大轮询次数（合 180s）
+
+    def _cleanup_temp(self) -> None:
+        """清理 temp 目录下的旧出图临时文件。"""
+        temp_dir = os.path.join(self._plugin_dir, "temp")
+        if not os.path.isdir(temp_dir):
+            return
+        removed = 0
+        for name in os.listdir(temp_dir):
+            if name.startswith("nyaadraw_") and name.endswith(".png"):
+                try:
+                    os.remove(os.path.join(temp_dir, name))
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            logger.info(f"[NyaaDraw] 清理了 {removed} 个旧临时文件")
+
+    async def _call_comfyui(self, prompt: str) -> str:
+        """向 ComfyUI 提交 workflow、轮询结果、下载图片到本地。
+
+        载入 Anima-Nyaa.api.json 模板 → 注入 19.seed(随机) + 92.prompt
+        → POST /prompt（Authorization: Bearer token）
+        → 轮询 GET /history/{prompt_id} 直到输出就绪
+        → GET /view 取字节 → 写临时 PNG → 返回路径。
+
+        Args:
+            prompt: P3 生成的英文画图提示词
+
+        Returns:
+            本地图片文件绝对路径
+
+        Raises:
+            RuntimeError: workflow 模板未加载
+            httpx.HTTPError: ComfyUI API 不可达 / 返回异常
+            TimeoutError: 轮询超时（180s）
+            KeyError: 响应格式不符合预期
+        """
+        if not self._workflow_json:
+            raise RuntimeError("ComfyUI workflow 模板未加载，无法出图")
+
+        # 1) 准备 workflow：注入 seed + prompt
+        workflow = json.loads(self._workflow_json)
+        workflow["19"]["inputs"]["seed"] = random.randint(1, 2**53 - 1)
+        workflow["92"]["inputs"]["prompt"] = prompt
+
+        headers = {"Authorization": f"Bearer {self.comfyui_token}"}
+
+        # 2) 提交 workflow → 拿到 prompt_id
+        submit_url = f"{self.comfyui_url}/prompt"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                submit_url, json={"prompt": workflow}, headers=headers
+            )
+            resp.raise_for_status()
+            prompt_id = resp.json()["prompt_id"]
+
+        logger.info(f"[NyaaDraw] ComfyUI workflow 已提交, prompt_id={prompt_id}")
+
+        # 3) 轮询 /history/{prompt_id} 等待出图完成
+        history_url = f"{self.comfyui_url}/history/{prompt_id}"
+        for attempt in range(1, self.COMFYUI_POLL_MAX + 1):
+            await asyncio.sleep(self.COMFYUI_POLL_INTERVAL)
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(history_url, headers=headers)
+                resp.raise_for_status()
+                history = resp.json()
+
+            if prompt_id not in history or "outputs" not in history[prompt_id]:
+                continue
+
+            # 找到第一个含 images 的输出节点
+            outputs = history[prompt_id]["outputs"]
+            for _node_id, node_output in outputs.items():
+                images = node_output.get("images")
+                if not images:
+                    continue
+                img = images[0]
+                filename = img["filename"]
+                subfolder = img.get("subfolder", "")
+                img_type = img.get("type", "output")
+
+                # 4) 下载图片字节
+                view_url = f"{self.comfyui_url}/view"
+                params = {
+                    "filename": filename,
+                    "subfolder": subfolder,
+                    "type": img_type,
+                }
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    img_resp = await client.get(
+                        view_url, params=params, headers=headers
+                    )
+                    img_resp.raise_for_status()
+
+                # 5) 写入本地临时文件
+                temp_dir = os.path.join(self._plugin_dir, "temp")
+                os.makedirs(temp_dir, exist_ok=True)
+                out_path = os.path.join(temp_dir, f"nyaadraw_{prompt_id}.png")
+                with open(out_path, "wb") as f:
+                    f.write(img_resp.content)
+
+                logger.info(
+                    f"[NyaaDraw] 出图完成: {out_path} "
+                    f"({len(img_resp.content)} bytes, 轮询 {attempt} 次)"
+                )
+                return out_path
+
+        raise TimeoutError(
+            f"ComfyUI 出图超时 ({self.COMFYUI_POLL_MAX * self.COMFYUI_POLL_INTERVAL}s)"
+        )
+
+    # ------------------------------------------------------------------
     # llm_tool: draw_image
     # ------------------------------------------------------------------
 
@@ -262,33 +397,34 @@ class NyaaDrawPlugin(Star):
         Args:
             description(string): 用户想要画的内容的完整中文描述。应尽可能保留用户原话的细节和意图，不要自行简化或改写。如果用户只给了简短的关键词（如"猫娘""星空"），也原样传入。
         '''
-        # P2: 输入内容审核 — 命中违禁则拒绝并中断
         logger.info(f"[NyaaDraw] draw_image 被调用, description={description[:100]}")
-        moderation = await self._moderate_input(description)
-        if not moderation["allowed"]:
-            yield event.plain_result(
-                f"喵…猫猫看了一下主人想画的内容，发现涉及了**{moderation['reason']}**…\n"
-                f"这个猫猫不能画喵！会危及群集体的安全的！(´;ω;`)\n"
-                f"请主人换一个健康正向的描述再来找猫猫吧～"
-            )
-            return
 
-        # P3: 提示词生成 agent（7 维框架 + 生成审核约束）
         try:
-            prompt = await self._gen_prompt(description)
-        except Exception as e:
-            logger.error(f"[NyaaDraw] 提示词生成失败: {e}")
-            yield event.plain_result(
-                f"喵…猫猫构思画面的时候脑子卡住了…(´;ω;`)\n"
-                f"可能是画图灵感枯竭了，主人等下再试试好不好？"
-            )
-            return
+            # ---- P2: 输入内容审核 ----
+            moderation = await self._moderate_input(description)
+            if not moderation["allowed"]:
+                yield event.plain_result(
+                    f"喵…猫猫看了一下主人想画的内容，发现涉及了**{moderation['reason']}**…\n"
+                    f"这个猫猫不能画喵！会危及群集体的安全的！(´;ω;`)\n"
+                    f"请主人换一个健康正向的描述再来找猫猫吧～"
+                )
+                return
 
-        # P3 stub: 展示生成的提示词，P4 接入 ComfyUI 出图
-        yield event.plain_result(
-            f"喵~猫猫收到主人的画图请求，已经构思好画面啦！(P3 ✅)\n"
-            f"主人想画的是：「{description}」\n\n"
-            f"📝 生成的英文提示词（{len(prompt)} chars）:\n"
-            f"---\n{prompt}\n---\n\n"
-            f"等 P4 接入 ComfyUI，猫猫就能真的画出图来啦～"
-        )
+            # ---- P3: 提示词生成 agent ----
+            prompt = await self._gen_prompt(description)
+
+            # ---- P4: ComfyUI 出图 ----
+            image_path = await self._call_comfyui(prompt)
+
+            # ---- 清理旧临时文件 ----
+            self._cleanup_temp()
+
+            # ---- 出图到 QQ ----
+            yield event.image_result(image_path)
+
+        except Exception as e:
+            logger.error(f"[NyaaDraw] 画图失败: {e}")
+            yield event.plain_result(
+                f"喵…猫猫画到一半笔掉了…画图服务好像出了点问题喵(´;ω;`)\n"
+                f"主人等下再试试好不好？猫猫先自己磨一下爪子～"
+            )

@@ -10,6 +10,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# 出图临时文件
+temp/
+
 # OS
 .DS_Store
 Thumbs.db
