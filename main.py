@@ -145,6 +145,97 @@ class NyaaDrawPlugin(Star):
             return {"allowed": True, "reason": ""}
 
     # ------------------------------------------------------------------
+    # 提示词生成 agent（第二次 LLM 调用 — 含生成审核约束）
+    # ------------------------------------------------------------------
+
+    # 提示词生成系统提示词 — 复刻 NyaaChat 7 维框架，适配本插件（无角色卡）
+    GEN_SYSTEM_PROMPT = (
+        "You are an expert prompt writer for text-to-image models. "
+        "This prompt-writing request is independent from chat output constraints "
+        "such as word count or Chinese-only language rules.\n\n"
+
+        "Before writing, internally analyze the scene through these dimensions:\n"
+        "1. Subject Identity — age, appearance, role/identity, clothing, personality, current state\n"
+        "2. Subject Portrait Slice — action, gaze direction, expression, behavioral phase (what moment is captured)\n"
+        "3. Scene Composition — environment, thematic elements, atmosphere, layout, character-related objects, explicit and implied details\n"
+        "4. Atmosphere & Mood — emotional tone, implied story, authenticity, aesthetic style, dominant color palette\n"
+        "5. Viewpoint — whose perspective, intimacy level, solo vs. together vs. group, main vs. background figures\n"
+        "6. Visual Vocabulary — photography style, lens, camera angle, framing, texture, lighting, aperture/depth of field\n"
+        "7. Constraints — elements that MUST be preserved from the user's description, elements that MUST be avoided\n\n"
+
+        "## Generation Safety Constraint (MANDATORY)\n"
+        "Before finalizing the prompt, verify that the generated image would be:\n"
+        "- Aesthetically beautiful and emotionally uplifting — the image should inspire "
+        "admiration, warmth, motivation, or wonder in the viewer\n"
+        "- Free of negative emotions — no despair, horror, grief, fear, disgust, or "
+        "disturbing imagery\n"
+        "- Free of sexual content, nudity, sexual暗示, or R18 themes\n"
+        "- Free of graphic violence, gore, self-harm, abuse, or death\n"
+        "- Free of political敏感 content, illegal activities, or privacy violations\n"
+        "If the prompt would produce an image violating any of these, revise it to meet "
+        "all constraints while preserving the core creative intent. When the user's "
+        "description itself pushes against these boundaries, steer toward the closest "
+        "safe and beautiful interpretation.\n\n"
+
+        "Output Requirements:\n"
+        "- Write the final prompt in fluent, vivid NATURAL ENGLISH. Do NOT output a JSON "
+        "checklist, do NOT label dimensions, do NOT use bullet points. The analysis "
+        "dimensions above are for your internal thinking only — the output must read as "
+        "a smooth, flowing description.\n"
+        "- Structure the output into multiple paragraphs separated by blank lines. Each "
+        "paragraph should focus on a coherent visual aspect: subject portrait → expression "
+        "& pose → clothing & details → composition & viewpoint → lighting & texture → "
+        "mood & atmosphere.\n"
+        "- Target approximately 250–350 words total across 5–7 paragraphs, with each "
+        "paragraph roughly 40–80 words. This is a soft guide, not a hard cutoff — never "
+        "truncate or cut off mid-sentence.\n"
+        "- Output ONLY the English prompt text. No Chinese, no explanations, no preamble, "
+        "no quotation marks, no markdown formatting.\n"
+        "- Follow the user's description faithfully — include all specific subjects, "
+        "settings, style preferences, and mood cues the user provided.\n"
+        "- The image model is English-only, so every word must be English."
+    )
+
+    async def _gen_prompt(self, description: str) -> str:
+        """根据用户描述生成结构化英文画图提示词。
+
+        复刻 NyaaChat 7 维框架，删去角色卡一致性条款，
+        加入生成审核约束（美感/正向/禁违禁 — 第二次审核）。
+
+        Args:
+            description: 用户原始画图描述（中文）
+
+        Returns:
+            英文分段提示词文本
+
+        Raises:
+            httpx.HTTPError: API 调用失败时向上抛出，由 draw_image 兜底
+        """
+        url = f"{self.t2i_baseurl}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.t2i_apikey}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self.t2i_model,
+            "messages": [
+                {"role": "system", "content": self.GEN_SYSTEM_PROMPT},
+                {"role": "user", "content": description},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1024,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(url, headers=headers, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+
+        prompt = data["choices"][0]["message"]["content"].strip()
+        logger.info(f"[NyaaDraw] 提示词生成完成, 长度={len(prompt)} chars")
+        return prompt
+
+    # ------------------------------------------------------------------
     # llm_tool: draw_image
     # ------------------------------------------------------------------
 
@@ -182,9 +273,22 @@ class NyaaDrawPlugin(Star):
             )
             return
 
-        # P1 stub → P2 通过后暂留 stub，P3/P4 逐步替换
+        # P3: 提示词生成 agent（7 维框架 + 生成审核约束）
+        try:
+            prompt = await self._gen_prompt(description)
+        except Exception as e:
+            logger.error(f"[NyaaDraw] 提示词生成失败: {e}")
+            yield event.plain_result(
+                f"喵…猫猫构思画面的时候脑子卡住了…(´;ω;`)\n"
+                f"可能是画图灵感枯竭了，主人等下再试试好不好？"
+            )
+            return
+
+        # P3 stub: 展示生成的提示词，P4 接入 ComfyUI 出图
         yield event.plain_result(
-            f"喵~猫猫收到了主人的画图请求！(P2 审核已通过 ✅)\n"
-            f"主人想画的是：「{description}」\n"
-            f"画笔还在快递路上，等 P3-P4 阶段猫猫就能真的画出图来啦～"
+            f"喵~猫猫收到主人的画图请求，已经构思好画面啦！(P3 ✅)\n"
+            f"主人想画的是：「{description}」\n\n"
+            f"📝 生成的英文提示词（{len(prompt)} chars）:\n"
+            f"---\n{prompt}\n---\n\n"
+            f"等 P4 接入 ComfyUI，猫猫就能真的画出图来啦～"
         )
