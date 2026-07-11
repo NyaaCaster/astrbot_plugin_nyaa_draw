@@ -259,13 +259,20 @@ class NyaaDrawPlugin(Star):
     COMFYUI_POLL_INTERVAL = 2       # 轮询间隔（秒）
     COMFYUI_POLL_MAX = 90           # 最大轮询次数（合 180s）
 
-    def _cleanup_temp(self) -> None:
-        """清理 temp 目录下的旧出图临时文件。"""
+    def _cleanup_temp(self, keep_path: str = None) -> None:
+        """清理 temp 目录下的旧出图临时文件。
+
+        keep_path 指向的当前图会被保留（避免在 astrbot 延迟读取发送前被删），
+        它会在下一次画图调用时作为旧图被清理。
+        """
         temp_dir = os.path.join(self._plugin_dir, "temp")
         if not os.path.isdir(temp_dir):
             return
+        keep_name = os.path.basename(keep_path) if keep_path else None
         removed = 0
         for name in os.listdir(temp_dir):
+            if name == keep_name:
+                continue
             if name.startswith("nyaadraw_") and name.endswith(".png"):
                 try:
                     os.remove(os.path.join(temp_dir, name))
@@ -416,8 +423,8 @@ class NyaaDrawPlugin(Star):
             # ---- P4: ComfyUI 出图 ----
             image_path = await self._call_comfyui(prompt)
 
-            # ---- 清理旧临时文件 ----
-            self._cleanup_temp()
+            # ---- 清理旧临时文件（保留当前图，避免发送前被删）----
+            self._cleanup_temp(keep_path=image_path)
 
             # ---- 出图到 QQ ----
             yield event.image_result(image_path)
