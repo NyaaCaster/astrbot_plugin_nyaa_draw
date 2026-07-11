@@ -1,0 +1,8 @@
+name: astrbot_plugin_nyaa_draw
+display_name: Nyaa猫猫画画
+desc: 猫猫画画插件 — 对话 LLM 自主决策触发 llm_tool，经内容审核 + 提示词 agent + ComfyUI 出图，成品图直接发送到 QQ 聊天中。需配置 .env（ComfyUI 地址/token + deepseek agent api）。
+help: 依赖 .env 配置文件（排除 Git），需手动放置到插件目录。WebUI 加载后可在「插件管理」中确认 draw_image 工具已注册。无需额外命令，bot 在自然对话中根据用户意图自主触发。
+version: 1.0.0
+author: NyaaCaster
+repo: https://github.com/NyaaCaster/astrbot_plugin_nyaa_draw
+astrbot_version: ">=4.0.0"

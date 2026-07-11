@@ -1,0 +1,15 @@
+# 私密配置（含密钥/token/地址，绝对禁止入库）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
