@@ -5,18 +5,32 @@
 调用 NyaaComfyUI 服务器生成图片，并将成品图作为 image 段发到 QQ。
 
 V1 全链路：插件骨架 + 配置加载 + 内容审核 + 提示词生成 + ComfyUI 出图。
+P5: 方案A→B 异步转换 — 即时回执 + 后台 Task + 并发/冷却 + lock_cid + reflux_result。
 """
 
 import asyncio
 import json
 import os
 import random
+import sys
 
 import httpx
 from dotenv import load_dotenv
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.message_components import Plain
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
+import astrbot.api.message_components as Comp
+
+# P5: 共享模块路径修正（plugins/ 目录）
+_plugins_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _plugins_dir not in sys.path:
+    sys.path.insert(0, _plugins_dir)
+
+from nyaa_orchestrator_common import (
+    TaskRecord, TaskStore, lock_cid, reflux_result,
+)
 
 
 class NyaaDrawPlugin(Star):
@@ -46,6 +60,11 @@ class NyaaDrawPlugin(Star):
         self.t2i_model: str | None = None
 
         self._load_config()
+
+        # P5: 并发/冷却/任务追踪
+        self._task_store = TaskStore()
+        self._active_tasks: dict[str, asyncio.Task] = {}
+        self._cooldown_sec: int = 30
 
         # ---- 预载 ComfyUI workflow 模板 ----
         workflow_path = os.path.join(self._plugin_dir, "Anima-Nyaa.api.json")
@@ -378,7 +397,7 @@ class NyaaDrawPlugin(Star):
         )
 
     # ------------------------------------------------------------------
-    # llm_tool: draw_image
+    # llm_tool: draw_image（P5: 方案B异步 — 即时回执 + 后台 Task）
     # ------------------------------------------------------------------
 
     @filter.llm_tool(name="draw_image")
@@ -407,7 +426,34 @@ class NyaaDrawPlugin(Star):
         logger.info(f"[NyaaDraw] draw_image 被调用, description={description[:100]}")
 
         try:
-            # ---- P2: 输入内容审核 ----
+            # ---- P5: 并发控制 ----
+            sender_id = event.get_sender_id()
+            if self._task_store.has_active(sender_id):
+                logger.info(
+                    f"[NyaaDraw] 用户 {sender_id} 已有进行中任务，拒绝"
+                )
+                yield event.plain_result(
+                    "喵…主人，猫猫还在画上一张图呢，"
+                    "等猫猫画完再画新的好不好？(´;ω;)"
+                )
+                return
+
+            # ---- P5: 冷却检查 ----
+            remaining = self._task_store.cooldown_remaining(
+                sender_id, self._cooldown_sec
+            )
+            if remaining > 0:
+                logger.info(
+                    f"[NyaaDraw] 用户 {sender_id} 冷却中 "
+                    f"({remaining:.0f}s)，拒绝"
+                )
+                yield event.plain_result(
+                    f"喵…主人，猫猫刚画完一张，"
+                    f"让猫猫喘口气喵～再等 {remaining:.0f} 秒好不好？(´;ω;)"
+                )
+                return
+
+            # ---- P2: 输入内容审核（快速，留在 llm_tool 内）----
             moderation = await self._moderate_input(description)
             if not moderation["allowed"]:
                 yield event.plain_result(
@@ -417,21 +463,106 @@ class NyaaDrawPlugin(Star):
                 )
                 return
 
+            # ---- P5: 锁定对话 cid（回灌用）----
+            umo = event.unified_msg_origin
+            cid = await lock_cid(
+                self.context, umo,
+                event.get_platform_id() or "",
+            )
+
+            # ---- P5: 创建任务记录 ----
+            record = TaskRecord(
+                task_id=TaskStore.new_task_id(),
+                sender_id=sender_id,
+                nickname=event.get_sender_nickname() or "",
+                umo=umo,
+                cid=cid,
+                task=description,
+            )
+            self._task_store.add(record)
+
+            # ---- 即时回执（规避 tool_call_timeout）----
+            yield event.plain_result(
+                f"喵～猫猫收到啦！(=^･ω･^=)\n"
+                f"🎨 正在用心画「{description[:30]}{'…' if len(description) > 30 else ''}」…\n"
+                f"画好了会主动发给主人的，稍等一下喵～"
+            )
+
+            # ---- 启动后台任务 ----
+            task = asyncio.create_task(
+                self._run_draw_task(record, description)
+            )
+            self._active_tasks[sender_id] = task
+            return
+
+        except Exception as e:
+            logger.error(f"[NyaaDraw] draw_image 执行异常: {e}")
+            yield event.plain_result(
+                f"喵…猫猫画画的时候爪爪滑了…出了点问题喵(´;ω;`)\n"
+                f"等下再试试好不好？"
+            )
+
+    # ------------------------------------------------------------------
+    # P5: 后台任务 — 提示词生成 + ComfyUI 出图 + 主动推送 + 回灌
+    # ------------------------------------------------------------------
+
+    async def _run_draw_task(
+        self,
+        record: TaskRecord,
+        description: str,
+    ) -> None:
+        """后台执行画图全流程，完成后主动推送结果 + 回灌 history。
+
+        此方法在 asyncio.Task 中运行，不阻塞 llm_tool 返回。
+        """
+        sender_id = record.sender_id
+        umo = record.umo
+        desc_short = description[:30]
+
+        try:
             # ---- P3: 提示词生成 agent ----
             prompt = await self._gen_prompt(description)
 
             # ---- P4: ComfyUI 出图 ----
             image_path = await self._call_comfyui(prompt)
 
-            # ---- 清理旧临时文件（保留当前图，避免发送前被删）----
+            # ---- 清理旧临时文件（保留当前图）----
             self._cleanup_temp(keep_path=image_path)
 
-            # ---- 出图到 QQ ----
-            yield event.image_result(image_path)
+            # ---- 主动推送结果 ----
+            report_msg = (
+                f"喵～猫猫画好啦！(=^･ω･^=)\n"
+                f"🎨 「{desc_short}{'…' if len(description) > 30 else ''}」"
+            )
+            mc = MessageChain(chain=[
+                Plain(report_msg),
+                Comp.Image.fromFileSystem(image_path),
+            ])
+            await self.context.send_message(umo, mc)
+            logger.info(
+                f"[NyaaDraw] 后台任务完成: sender={sender_id}, "
+                f"image={image_path}"
+            )
+
+            # ---- P5: 回灌 conversation history ----
+            await reflux_result(self.context, record, report_msg)
 
         except Exception as e:
-            logger.error(f"[NyaaDraw] 画图失败: {e}")
-            yield event.plain_result(
-                f"喵…猫猫画到一半笔掉了…画图服务好像出了点问题喵(´;ω;`)\n"
-                f"主人等下再试试好不好？猫猫先自己磨一下爪子～"
+            logger.error(f"[NyaaDraw] 后台任务异常: {e}")
+            try:
+                error_mc = MessageChain(chain=[Plain(
+                    f"喵…猫猫画到一半笔掉了…画图服务好像出了点问题喵(´;ω;`)\n"
+                    f"主人等下再试试好不好？猫猫先自己磨一下爪子～"
+                )])
+                await self.context.send_message(umo, error_mc)
+            except Exception as push_err:
+                logger.error(f"[NyaaDraw] 推送错误消息也失败了: {push_err}")
+
+        finally:
+            # P5: 清理任务记录 + 记录冷却起点
+            self._task_store.pop(record.task_id)
+            self._task_store.mark_done(sender_id)
+            self._active_tasks.pop(sender_id, None)
+            logger.info(
+                f"[NyaaDraw] 后台任务清理: sender={sender_id}"
             )
