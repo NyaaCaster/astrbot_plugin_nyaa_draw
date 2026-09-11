@@ -33,6 +33,19 @@ from nyaa_orchestrator_common import (
 )
 
 
+def _clamp_int(raw, lo: int, hi: int, default: int) -> int:
+    """把 .env 里的整数值夹到 [lo, hi]；缺失或非法一律回退 default。
+
+    Raises:
+        TypeError: 不抛出——任何解析失败都走 default。
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
+
+
 class NyaaDrawPlugin(Star):
     """AstrBot 画图插件。
 
@@ -58,6 +71,11 @@ class NyaaDrawPlugin(Star):
         self.t2i_baseurl: str | None = None
         self.t2i_apikey: str | None = None
         self.t2i_model: str | None = None
+
+        # T2I agent 调参（可选，默认值见 _load_config）
+        self.t2i_reasoning: str = "off"
+        self.t2i_max_tokens: int = 1600
+        self.t2i_moderation_max_tokens: int = 384
 
         self._load_config()
 
@@ -98,6 +116,25 @@ class NyaaDrawPlugin(Star):
         self.t2i_apikey = os.getenv("T2I_AGENT_API_APIKEY")
         self.t2i_model = os.getenv("T2I_AGENT_API_MODEL")
 
+        # ---- 可选调参 ----
+        # 上游 deepseek-flash / deepseek-v4-pro 都是推理模型，隐藏思考 token 与正文
+        # 共享 max_tokens 预算（实测 max_tokens<=64 时正文被思考吃空）。
+        #   T2I_AGENT_API_REASONING=off  → 请求带 reasoning_effort:"none"，实测
+        #      completion tokens −49%、延迟 −34%，输出质量（段数/词数/纯英文）不降。
+        #      注意 enable_thinking / chat_template_kwargs / include_reasoning 会被
+        #      该端点静默忽略（不报错但仍推理），不可依赖。
+        #   T2I_AGENT_API_MAX_TOKENS     → 提示词生成长度上限（默认 1600，下限 512）
+        #   T2I_AGENT_MODERATION_MAX_TOKENS → 审核 JSON 上限（默认 384，下限 128）
+        self.t2i_reasoning = (
+            os.getenv("T2I_AGENT_API_REASONING", "off") or "off"
+        ).strip().lower()
+        self.t2i_max_tokens = _clamp_int(
+            os.getenv("T2I_AGENT_API_MAX_TOKENS"), 512, 8192, 1600
+        )
+        self.t2i_moderation_max_tokens = _clamp_int(
+            os.getenv("T2I_AGENT_MODERATION_MAX_TOKENS"), 128, 2048, 384
+        )
+
         missing = [f"{k} ({desc})" for k, desc in required.items() if not os.getenv(k)]
         if missing:
             logger.warning(
@@ -106,6 +143,11 @@ class NyaaDrawPlugin(Star):
             )
         else:
             logger.info("[NyaaDraw] 全部 5 项配置加载成功")
+        logger.info(
+            f"[NyaaDraw] T2I agent 调参: reasoning={self.t2i_reasoning}, "
+            f"gen_max_tokens={self.t2i_max_tokens}, "
+            f"moderation_max_tokens={self.t2i_moderation_max_tokens}"
+        )
 
     # ------------------------------------------------------------------
     # 输入内容审核
@@ -152,9 +194,11 @@ class NyaaDrawPlugin(Star):
                 {"role": "user", "content": description},
             ],
             "temperature": 0.0,
-            "max_tokens": 128,
+            "max_tokens": self.t2i_moderation_max_tokens,
             "response_format": {"type": "json_object"},
         }
+        if self.t2i_reasoning != "on":
+            body["reasoning_effort"] = "none"
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -163,6 +207,18 @@ class NyaaDrawPlugin(Star):
                 data = resp.json()
 
             content = data["choices"][0]["message"]["content"]
+            if not (content or "").strip():
+                # 空正文 = max_tokens 被隐藏思考吃光（finish_reason=length）或上游异常。
+                # 保持 fail-open 语义（不阻断正常画图），但必须显式留痕，
+                # 否则审核会「静默放行」，且日志里看不出原因。
+                logger.warning(
+                    "[NyaaDraw] 内容审核返回空正文，按 fail-open 放行 "
+                    f"(finish_reason={data['choices'][0].get('finish_reason')}, "
+                    f"max_tokens={self.t2i_moderation_max_tokens}, "
+                    f"reasoning={self.t2i_reasoning})"
+                )
+                return {"allowed": True, "reason": ""}
+
             result = json.loads(content)
 
             allowed = bool(result.get("allowed", True))
@@ -244,6 +300,7 @@ class NyaaDrawPlugin(Star):
             英文分段提示词文本
 
         Raises:
+            RuntimeError: 上游返回空正文（通常是 max_tokens 被隐藏思考吃光）
             httpx.HTTPError: API 调用失败时向上抛出，由 draw_image 兜底
         """
         url = f"{self.t2i_baseurl}/v1/chat/completions"
@@ -258,15 +315,28 @@ class NyaaDrawPlugin(Star):
                 {"role": "user", "content": description},
             ],
             "temperature": 0.7,
-            "max_tokens": 1024,
+            "max_tokens": self.t2i_max_tokens,
         }
+        if self.t2i_reasoning != "on":
+            body["reasoning_effort"] = "none"
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(url, headers=headers, json=body)
             resp.raise_for_status()
             data = resp.json()
 
-        prompt = data["choices"][0]["message"]["content"].strip()
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+        if not (content or "").strip():
+            # 显式报错，避免 None.strip() 的 AttributeError 掩盖真实原因
+            # （max_tokens 被隐藏思考吃光 → finish_reason=length、正文为空）。
+            raise RuntimeError(
+                "提示词 agent 返回空正文 "
+                f"(finish_reason={choice.get('finish_reason')}, "
+                f"max_tokens={self.t2i_max_tokens}, reasoning={self.t2i_reasoning})"
+            )
+
+        prompt = content.strip()
         logger.info(f"[NyaaDraw] 提示词生成完成, 长度={len(prompt)} chars")
         return prompt
 

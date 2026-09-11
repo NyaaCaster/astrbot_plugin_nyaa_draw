@@ -45,7 +45,10 @@
 | `COMFYUI_FIXED_TOKEN` | ComfyUI 鉴权 Bearer token（含 `$` 字符，dotenv 单引号包裹） |
 | `T2I_AGENT_API_BASEURL` | 提示词 agent / 审核 API 地址（如 `https://api.deepseek.com`） |
 | `T2I_AGENT_API_APIKEY` | 提示词 agent / 审核 API key |
-| `T2I_AGENT_API_MODEL` | 提示词 agent / 审核模型名（如 `deepseek-v4-flash`） |
+| `T2I_AGENT_API_MODEL` | 提示词 agent / 审核模型名（如 `deepseek-flash`） |
+| `T2I_AGENT_API_REASONING` | 是否保留模型思考 `on`/`off`（可选，默认 `off`） |
+| `T2I_AGENT_API_MAX_TOKENS` | 提示词生成长度上限（可选，默认 1600，下限 512） |
+| `T2I_AGENT_MODERATION_MAX_TOKENS` | 审核 JSON 长度上限（可选，默认 384，下限 128） |
 
 `.env` 示例（值均为示意，请替换为实际配置）：
 
@@ -54,10 +57,30 @@ COMFYUI_FIXED_URL=http://111.198.54.18:58199
 COMFYUI_FIXED_TOKEN='$2b$12$...'
 T2I_AGENT_API_BASEURL=https://api.deepseek.com
 T2I_AGENT_API_APIKEY=sk-...
-T2I_AGENT_API_MODEL=deepseek-v4-flash
+T2I_AGENT_API_MODEL=deepseek-flash
+T2I_AGENT_API_REASONING=off
+T2I_AGENT_API_MAX_TOKENS=1600
+T2I_AGENT_MODERATION_MAX_TOKENS=384
 ```
 
 > 🔴 **安全红线**：`.env` 已被 `.gitignore` 排除，**禁止**将密钥提交到 Git 仓库。`COMFYUI_FIXED_TOKEN` 含 `$` 字符，必须用单引号包裹以避免 shell 展开。
+
+### ⚠️ 推理模型与 max_tokens 预算（重要）
+
+`deepseek-flash` / `deepseek-v4-pro` **都是推理模型**，隐藏的思考 token 与正文**共享同一份
+`max_tokens` 预算**——预算被思考吃光时上游返回 `finish_reason=length` 且**正文为空**。实测数据：
+
+| 场景 | 思考开启 | 关闭思考（`reasoning_effort:"none"`） |
+| --- | --- | --- |
+| 审核（拒绝用例） | 115 / 128 tokens，距上限仅 13 | **14 tokens**，稳定返回合法 JSON |
+| 提示词生成 | 625 tokens / 4.8s | **~400 tokens / 3.0s**，段数词数质量不变 |
+
+插件默认关闭思考。两点提醒：
+
+- 审核若返回空正文，插件按既有的 **fail-open** 语义放行，但会打 `WARNING` 留痕——这是
+  「静默放行」唯一的可观测信号，看到它说明预算配置或上游有问题。
+- `enable_thinking` / `chat_template_kwargs` / `include_reasoning` 等参数会被该端点
+  **静默忽略**（不报错、思考照跑），只有 `reasoning_effort` 有效，不要用它们来关思考。
 
 ## 工作原理
 
