@@ -544,7 +544,7 @@ class NyaaDrawPlugin(Star):
             record = TaskRecord(
                 task_id=TaskStore.new_task_id(),
                 sender_id=sender_id,
-                nickname=event.get_sender_nickname() or "",
+                nickname=event.get_sender_name() or "",
                 umo=umo,
                 cid=cid,
                 task=description,
